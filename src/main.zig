@@ -1,4 +1,10 @@
-fn readFile() {}
+fn getFileContents(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    // So you don't open a massive file and use all your ram
+    return try file.readToEndAlloc(allocator, 50 * 1024 * 1024);
+}
 
 fn walkDir(allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
     var dir = try std.fs.cwd().openDir(".", .{ .iterate = true });
@@ -58,6 +64,33 @@ fn omitPathsWithPrefix(allocator: std.mem.Allocator, paths_list: *std.ArrayList(
     }
 }
 
+fn getAndParseInput(allocator: std.mem.Allocator) !struct { list_type: []const u8, list: [][:0]u8 } {
+    const args = try std.process.argsAlloc(allocator);
+    if (args.len <= 1) {
+        std.debug.print("Error, -a or -o not found\n", .{});
+        return std.process.exit(0);
+    } else if (false == (std.mem.eql(u8, args[1], "-a") or std.mem.eql(u8, args[1], "--allowlist")) and (false == std.mem.eql(u8, args[1], "-o") or std.mem.eql(u8, args[1], "--omitlist"))) {
+        std.debug.print("Error, -a or -o not found\n", .{});
+        return std.process.exit(0);
+    } else if (args.len <= 2) {
+        std.debug.print("Error, no files specified\n", .{});
+        return std.process.exit(0);
+    } else if (std.mem.eql(u8, args[1], "-a") or std.mem.eql(u8, args[1], "--allowlist")) {
+        return .{
+            .list_type = "allowlist",
+            .list = args[2..],
+        };
+    } else if (std.mem.eql(u8, args[1], "-o") or std.mem.eql(u8, args[1], "--omitlist")) {
+        return .{
+            .list_type = "omitlist",
+            .list = args[2..],
+        };
+    }
+
+    std.debug.print("Unknown error\n", .{});
+    return std.process.exit(0);
+}
+
 fn keepOnly(
     allocator: std.mem.Allocator,
     paths_list: *std.ArrayList([]const u8),
@@ -72,7 +105,7 @@ fn keepOnly(
             }
         }
         if (!found) {
-            const err_msg = try std.fmt.allocPrint(allocator, "Allow-listed path not found on disk: {s}\n", .{allowed_path});
+            const err_msg = try std.fmt.allocPrint(allocator, "Allow-listed path not found: {s}\n", .{allowed_path});
             defer allocator.free(err_msg); // Good practice to free this too
             _ = std.io.getStdErr().writer().write(err_msg) catch {};
             return CatdError.InvalidAllowList;
@@ -102,19 +135,11 @@ fn keepOnly(
 pub fn main() !void {
     const allocator = gpa.allocator();
 
+    const args = try getAndParseInput(allocator);
     var paths_list = try walkDir(allocator);
-    defer {
-        paths_list.deinit();
-    }
-
-    const unneeded_prefixes = &[_][]const u8{
-        ".git/",
-        ".zig-cache/",
-    };
-    const allowlist = &[_][]const u8{};
-
-    if (allowlist.len != 0) {
-        keepOnly(gpa.allocator(), &paths_list, allowlist) catch |err| {
+    if (std.mem.eql(u8, args.list_type, "allowlist")) {
+        const allowlist = args.list;
+        keepOnly(allocator, &paths_list, allowlist) catch |err| {
             std.io.getStdErr().writer().print("Error:\n", .{}) catch {};
             switch (err) {
                 error.InvalidAllowList => {
@@ -124,14 +149,27 @@ pub fn main() !void {
                     std.io.getStdErr().writer().print("Ran out of memory.\n", .{}) catch {};
                 },
             }
-            return std.process.exit(1);
+            return std.process.exit(0);
         };
-    } else {
-        omitPathsWithPrefix(allocator, &paths_list, unneeded_prefixes);
+    } else if (std.mem.eql(u8, args.list_type, "omitlist")) {
+        const omit_list = args.list;
+        omitPathsWithPrefix(allocator, &paths_list, omit_list);
+    }
+
+    defer {
+        for (paths_list.items) |p| {
+            allocator.free(p);
+        }
+        paths_list.deinit();
     }
 
     for (paths_list.items) |path_item| {
+        try write("=============================================================================", "\n");
         try write(path_item, "\n");
+        try write("=============================================================================", "\n");
+        const contents = try getFileContents(allocator, path_item);
+        try write(contents, "\n");
+        allocator.free(contents);
     }
 }
 
