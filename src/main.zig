@@ -31,10 +31,6 @@ fn walkProvidedPaths(allocator: std.mem.Allocator, paths_to_walk: []const []cons
 
             while (try dirWalker.next()) |entry| {
                 if (entry.kind == .file) {
-                    // THE FIX IS HERE:
-                    // entry.path is relative to the directory being walked.
-                    // We must join it with the starting path.
-                    // e.g., start_path="src", entry.path="main.zig" -> "src/main.zig"
                     const full_path = try std.fs.path.join(allocator, &.{ start_path, entry.path });
                     try all_found_files.append(full_path);
                 }
@@ -98,25 +94,29 @@ fn keepOnlyAllowedPaths(allocator: std.mem.Allocator, master_list: *std.ArrayLis
     }
 }
 
-// NEW function that takes a slice instead of allocating.
-fn getAndParseInputFromSlice(args: []const []const u8) !struct { list_type: []const u8, list: []const []const u8 } {
+fn getAndParseInputFromSlice(args: []const []const u8) !struct { flag_type: []const u8, list: []const []const u8 } {
     if (args.len <= 1) {
-        std.debug.print("Error, -a or -o not found\n", .{});
+        std.debug.print("Error, flag not found. Try --help\n", .{});
         return std.process.exit(0);
-    } else if (false == (std.mem.eql(u8, args[1], "-a") or std.mem.eql(u8, args[1], "--allowlist")) and (false == std.mem.eql(u8, args[1], "-o") or std.mem.eql(u8, args[1], "--omitlist"))) {
-        std.debug.print("Error, -a or -o not found\n", .{});
+    } else if (false == (std.mem.eql(u8, args[1], "-a") or std.mem.eql(u8, args[1], "--allowlist")) and (false == std.mem.eql(u8, args[1], "-o") or std.mem.eql(u8, args[1], "--omitlist")) and (false == (std.mem.eql(u8, args[1], "-h") or std.mem.eql(u8, args[1], "--help")))) {
+        std.debug.print("Error, valid flag not found. Try --help\n", .{});
         return std.process.exit(0);
-    } else if (args.len <= 2) {
+    } else if ((args.len <= 2) and !((std.mem.eql(u8, args[1], "-h")) or (std.mem.eql(u8, args[1], "--help")))) {
         std.debug.print("Error, no files specified\n", .{});
         return std.process.exit(0);
     } else if (std.mem.eql(u8, args[1], "-a") or std.mem.eql(u8, args[1], "--allowlist")) {
         return .{
-            .list_type = "allowlist",
-            .list = args[2..], // This is fine, we aren't freeing this slice directly.
+            .flag_type = "allowlist",
+            .list = args[2..],
         };
     } else if (std.mem.eql(u8, args[1], "-o") or std.mem.eql(u8, args[1], "--omitlist")) {
         return .{
-            .list_type = "omitlist",
+            .flag_type = "omitlist",
+            .list = args[2..],
+        };
+    } else if (std.mem.eql(u8, args[1], "-h") or std.mem.eql(u8, args[1], "--help")) {
+        return .{
+            .flag_type = "help",
             .list = args[2..],
         };
     }
@@ -129,18 +129,15 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    // NEW: We need to capture the full original argument list to free it correctly.
     const original_args_list = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, original_args_list);
 
-    // CHANGED: We now parse from the already-allocated list.
     const parsed_args = getAndParseInputFromSlice(original_args_list) catch |err| {
-        // Handle parsing errors if getAndParseInput is fallible
         std.debug.print("Error parsing arguments: {s}\n", .{@errorName(err)});
         return;
     };
 
-    if (std.mem.eql(u8, parsed_args.list_type, "allowlist")) {
+    if (std.mem.eql(u8, parsed_args.flag_type, "allowlist")) {
         var paths_list = try walkProvidedPaths(allocator, parsed_args.list);
         defer {
             for (paths_list.items) |p| allocator.free(p);
@@ -155,7 +152,7 @@ pub fn main() !void {
             defer allocator.free(contents);
             try write(contents, "\n");
         }
-    } else if (std.mem.eql(u8, parsed_args.list_type, "omitlist")) {
+    } else if (std.mem.eql(u8, parsed_args.flag_type, "omitlist")) {
         var paths_list = try walkProvidedPaths(allocator, &[_][]const u8{"."});
         defer {
             for (paths_list.items) |p| allocator.free(p);
@@ -173,5 +170,17 @@ pub fn main() !void {
             defer allocator.free(contents);
             try write(contents, "\n");
         }
+    } else if (std.mem.eql(u8, parsed_args.flag_type, "help")) {
+        try write(
+            \\USAGE:
+            \\catd [OPTIONS] PATH
+            \\
+            \\  ARGUMENTS:
+            \\  PATH | A file or directory to print.
+            \\
+            \\INPUT OPTIONS:
+            \\  -o, --omitlist | Print all paths other than these.
+            \\  -a, --allowlist | Print only these paths.
+        , "\n");
     }
 }
