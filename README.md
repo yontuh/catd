@@ -1,6 +1,5 @@
 ## How to Use
 ### NixOS
-Add:
 **1. Add the Flake as an Input**
 
 ```nix
