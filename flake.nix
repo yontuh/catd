@@ -1,5 +1,5 @@
 {
-  description = "A Zig project with specific Zig version (0.14.1)";
+  description = "A flake for the catd Zig project";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -15,29 +15,42 @@
     ...
   } @ inputs:
     flake-utils.lib.eachDefaultSystem (system: let
-      zigVersion = "0.14.1";
       pkgs = import nixpkgs {
         inherit system;
-        overlays = [
-          (final: prev: {
-            zigpkgs = inputs.zig-overlay.packages.${prev.system};
-          })
-        ];
+        overlays = [zig-overlay.overlays.default];
       };
+
+      zigVersion = "0.14.1";
+      projectName = "catd";
       zig = pkgs.zigpkgs.${zigVersion};
     in {
-      devShells.default = pkgs.mkShell {
-        packages = [
-          # Core tools
-          zig
-          pkgs.pkg-config # Helps find libraries (very important)
-        ];
+      packages.${projectName} = pkgs.stdenv.mkDerivation {
+        pname = projectName;
+        version = "0.1.0";
+        src = self;
 
-        shellHook = ''
-          echo "--- Raylib Zig Project Environment ---"
-          echo "| Zig compiler:   $(zig version) (from zig-overlay)"
-          echo "| Target shell:   Nushell ($(nu --version))"
+        nativeBuildInputs = [zig];
+
+        buildPhase = ''
+          # Set the cache directory to a temporary, writable location
+          export ZIG_GLOBAL_CACHE_DIR="$(pwd)/zig-cache"
+
+          # Now run the build command
+          zig build -Doptimize=ReleaseFast
         '';
+
+        installPhase = ''
+          # Create the bin directory in the output path
+          mkdir -p $out/bin
+          # Copy the compiled binary from zig's output to the Nix output
+          cp zig-out/bin/${projectName} $out/bin/
+        '';
+      };
+
+      defaultPackage = self.packages.${system}.${projectName};
+
+      devShells.default = pkgs.mkShell {
+        packages = [zig pkgs.zls pkgs.pkg-config];
       };
     });
 }

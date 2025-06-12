@@ -1,38 +1,51 @@
+const std = @import("std");
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const CatdError = error{InvalidAllowList};
+
 fn getFileContents(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
-    // So you don't open a massive file and use all your ram
     return try file.readToEndAlloc(allocator, 50 * 1024 * 1024);
 }
 
-fn walkDir(allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
-    var dir = try std.fs.cwd().openDir(".", .{ .iterate = true });
-    defer dir.close();
-
-    var dirWalker = try dir.walk(allocator);
-    defer dirWalker.deinit();
-
-    var paths = std.ArrayList([]const u8).init(allocator);
+fn walkProvidedPaths(allocator: std.mem.Allocator, paths_to_walk: []const []const u8) !std.ArrayList([]const u8) {
+    var all_found_files = std.ArrayList([]const u8).init(allocator);
     errdefer {
-        for (paths.items) |p| {
-            allocator.free(p);
-        }
-        paths.deinit();
+        for (all_found_files.items) |p| allocator.free(p);
+        all_found_files.deinit();
     }
 
-    while (try dirWalker.next()) |entry| {
-        if (entry.kind == .file) {
-            const dupe_path = try allocator.dupe(u8, entry.path);
+    for (paths_to_walk) |start_path| {
+        const stat = std.fs.cwd().statFile(start_path) catch |err| {
+            std.debug.print("Error accessing path '{s}': {s}\n", .{ start_path, @errorName(err) });
+            continue;
+        };
 
-            paths.append(dupe_path) catch |err| {
-                allocator.free(dupe_path);
-                return err;
-            };
+        if (stat.kind == .directory) {
+            var dir = try std.fs.cwd().openDir(start_path, .{ .iterate = true });
+            defer dir.close();
+
+            var dirWalker = try dir.walk(allocator);
+            defer dirWalker.deinit();
+
+            while (try dirWalker.next()) |entry| {
+                if (entry.kind == .file) {
+                    // THE FIX IS HERE:
+                    // entry.path is relative to the directory being walked.
+                    // We must join it with the starting path.
+                    // e.g., start_path="src", entry.path="main.zig" -> "src/main.zig"
+                    const full_path = try std.fs.path.join(allocator, &.{ start_path, entry.path });
+                    try all_found_files.append(full_path);
+                }
+            }
+        } else if (stat.kind == .file) {
+            const dupe_path = try allocator.dupe(u8, start_path);
+            try all_found_files.append(dupe_path);
         }
     }
 
-    return paths;
+    return all_found_files;
 }
 
 fn write(data: []const u8, extra: []const u8) !void {
@@ -64,8 +77,29 @@ fn omitPathsWithPrefix(allocator: std.mem.Allocator, paths_list: *std.ArrayList(
     }
 }
 
-fn getAndParseInput(allocator: std.mem.Allocator) !struct { list_type: []const u8, list: [][:0]u8 } {
-    const args = try std.process.argsAlloc(allocator);
+fn keepOnlyAllowedPaths(allocator: std.mem.Allocator, master_list: *std.ArrayList([]const u8), allowlist: []const []const u8) void {
+    var i: usize = 0;
+    while (i < master_list.items.len) {
+        const current_path = master_list.items[i];
+        var should_keep = false;
+        for (allowlist) |allowed_prefix| {
+            if (std.mem.startsWith(u8, current_path, allowed_prefix)) {
+                should_keep = true;
+                break;
+            }
+        }
+
+        if (should_keep) {
+            i += 1;
+        } else {
+            const removed_path = master_list.orderedRemove(i);
+            allocator.free(removed_path);
+        }
+    }
+}
+
+// NEW function that takes a slice instead of allocating.
+fn getAndParseInputFromSlice(args: []const []const u8) !struct { list_type: []const u8, list: []const []const u8 } {
     if (args.len <= 1) {
         std.debug.print("Error, -a or -o not found\n", .{});
         return std.process.exit(0);
@@ -78,7 +112,7 @@ fn getAndParseInput(allocator: std.mem.Allocator) !struct { list_type: []const u
     } else if (std.mem.eql(u8, args[1], "-a") or std.mem.eql(u8, args[1], "--allowlist")) {
         return .{
             .list_type = "allowlist",
-            .list = args[2..],
+            .list = args[2..], // This is fine, we aren't freeing this slice directly.
         };
     } else if (std.mem.eql(u8, args[1], "-o") or std.mem.eql(u8, args[1], "--omitlist")) {
         return .{
@@ -91,88 +125,53 @@ fn getAndParseInput(allocator: std.mem.Allocator) !struct { list_type: []const u
     return std.process.exit(0);
 }
 
-fn keepOnly(
-    allocator: std.mem.Allocator,
-    paths_list: *std.ArrayList([]const u8),
-    allowlist: []const []const u8,
-) (CatdError || error{OutOfMemory})!void {
-    for (allowlist) |allowed_path| {
-        var found = false;
-        for (paths_list.items) |path| {
-            if (std.mem.startsWith(u8, path, allowed_path)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            const err_msg = try std.fmt.allocPrint(allocator, "Allow-listed path not found: {s}\n", .{allowed_path});
-            defer allocator.free(err_msg); // Good practice to free this too
-            _ = std.io.getStdErr().writer().write(err_msg) catch {};
-            return CatdError.InvalidAllowList;
-        }
-    }
-
-    var i: usize = 0;
-    while (i < paths_list.items.len) {
-        const current_path = paths_list.items[i];
-        var should_keep = false;
-        for (allowlist) |allowed_prefix| {
-            if (std.mem.startsWith(u8, current_path, allowed_prefix)) {
-                should_keep = true;
-                break;
-            }
-        }
-
-        if (should_keep) {
-            i += 1;
-        } else {
-            const removed_path = paths_list.orderedRemove(i);
-            allocator.free(removed_path);
-        }
-    }
-}
-
 pub fn main() !void {
     const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
 
-    const args = try getAndParseInput(allocator);
-    var paths_list = try walkDir(allocator);
-    if (std.mem.eql(u8, args.list_type, "allowlist")) {
-        const allowlist = args.list;
-        keepOnly(allocator, &paths_list, allowlist) catch |err| {
-            std.io.getStdErr().writer().print("Error:\n", .{}) catch {};
-            switch (err) {
-                error.InvalidAllowList => {
-                    std.io.getStdErr().writer().print("Invalid path given to allow list\n", .{}) catch {};
-                },
-                error.OutOfMemory => {
-                    std.io.getStdErr().writer().print("Ran out of memory.\n", .{}) catch {};
-                },
-            }
-            return std.process.exit(0);
-        };
-    } else if (std.mem.eql(u8, args.list_type, "omitlist")) {
-        const omit_list = args.list;
-        omitPathsWithPrefix(allocator, &paths_list, omit_list);
-    }
+    // NEW: We need to capture the full original argument list to free it correctly.
+    const original_args_list = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, original_args_list);
 
-    defer {
-        for (paths_list.items) |p| {
-            allocator.free(p);
+    // CHANGED: We now parse from the already-allocated list.
+    const parsed_args = getAndParseInputFromSlice(original_args_list) catch |err| {
+        // Handle parsing errors if getAndParseInput is fallible
+        std.debug.print("Error parsing arguments: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    if (std.mem.eql(u8, parsed_args.list_type, "allowlist")) {
+        var paths_list = try walkProvidedPaths(allocator, parsed_args.list);
+        defer {
+            for (paths_list.items) |p| allocator.free(p);
+            paths_list.deinit();
         }
-        paths_list.deinit();
-    }
 
-    for (paths_list.items) |path_item| {
-        try write("=============================================================================", "\n");
-        try write(path_item, "\n");
-        try write("=============================================================================", "\n");
-        const contents = try getFileContents(allocator, path_item);
-        try write(contents, "\n");
-        allocator.free(contents);
+        for (paths_list.items) |path_item| {
+            try write("=============================================================================", "\n");
+            try write(path_item, "\n");
+            try write("=============================================================================", "\n");
+            const contents = try getFileContents(allocator, path_item);
+            defer allocator.free(contents);
+            try write(contents, "\n");
+        }
+    } else if (std.mem.eql(u8, parsed_args.list_type, "omitlist")) {
+        var paths_list = try walkProvidedPaths(allocator, &[_][]const u8{"."});
+        defer {
+            for (paths_list.items) |p| allocator.free(p);
+            paths_list.deinit();
+        }
+
+        const omit_list = parsed_args.list;
+        omitPathsWithPrefix(allocator, &paths_list, omit_list);
+
+        for (paths_list.items) |path_item| {
+            try write("=============================================================================", "\n");
+            try write(path_item, "\n");
+            try write("=============================================================================", "\n");
+            const contents = try getFileContents(allocator, path_item);
+            defer allocator.free(contents);
+            try write(contents, "\n");
+        }
     }
 }
-
-const std = @import("std");
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-const CatdError = error{InvalidAllowList};
