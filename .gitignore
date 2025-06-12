@@ -1,4 +1,4 @@
-.zig-cache
-.direnv
+.zig-cache/
+.direnv/
 .git
 result
