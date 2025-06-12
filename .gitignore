@@ -1,3 +1,4 @@
 .zig-cache
 .direnv
 .git
+result
